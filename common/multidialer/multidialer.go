@@ -186,6 +186,7 @@ type tcpSession struct {
 	acceptChan chan *tcpStream
 	closeOnce  sync.Once
 	closed     chan struct{}
+	writeMu    sync.Mutex // serialize frame writes to avoid interleaving corruption
 
 	// Stream IDs are divided into odd/even to prevent collisions.
 	// Client creates odd-numbered streams, server creates even-numbered streams.
@@ -303,6 +304,14 @@ func (s *tcpSession) readLoop() {
 			// This is a new stream initiated by the peer
 			stream := newTCPStream(id, s)
 			s.streams.Store(id, stream)
+			// Debug instrumentation: log first frame bytes for new stream
+			if log.GetLevel() <= log.DebugLevel {
+				preview := data
+				if len(preview) > 32 {
+					preview = preview[:32]
+				}
+				log.Debugf("tcpSession: new stream id=%d firstFrameLen=%d bytes=%x", id, len(data), preview)
+			}
 			stream.pushData(data) // Push initial data
 			bufferPool.Put(bufPtr)
 
@@ -314,6 +323,13 @@ func (s *tcpSession) readLoop() {
 		} else {
 			// This is data for an existing stream
 			stream := val.(*tcpStream)
+			if len(data) == 0 {
+				// EOF from peer: signal then remove
+				stream.pushData(data)
+				bufferPool.Put(bufPtr)
+				s.removeStream(id)
+				continue
+			}
 			stream.pushData(data)
 			bufferPool.Put(bufPtr)
 		}
@@ -321,6 +337,9 @@ func (s *tcpSession) readLoop() {
 }
 
 func (s *tcpSession) writeFrame(id uint16, data []byte) (int, error) {
+	// Serialize to guarantee header+payload atomicity w.r.t other frames.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	// Fast-path: ensure session still open
 	select {
 	case <-s.closed:
@@ -337,15 +356,30 @@ func (s *tcpSession) writeFrame(id uint16, data []byte) (int, error) {
 	binary.BigEndian.PutUint16(header[0:2], id)
 	binary.BigEndian.PutUint16(header[2:4], uint16(len(data)))
 
-	// Use net.Buffers to leverage writev (coalesced syscalls) when possible.
-	// Fallback: if underlying conn doesn't implement writev, WriteTo will loop.
+	// Use net.Buffers to leverage writev. We MUST handle partial writes.
 	bufs := net.Buffers{header[:], data}
-	n64, err := bufs.WriteTo(s.conn)
-	if err != nil {
-		// Close session on write failure to propagate error to all streams.
-		s.Close(err)
+	total := 0
+	for len(bufs) > 0 {
+		n64, err := bufs.WriteTo(s.conn)
+		total += int(n64)
+		if err != nil {
+			// Close session on write failure to propagate error to all streams.
+			s.Close(err)
+			return total, err
+		}
+		// Trim written bytes from bufs (partial write handling)
+		remaining := int(n64)
+		for remaining > 0 && len(bufs) > 0 {
+			if remaining >= len(bufs[0]) {
+				remaining -= len(bufs[0])
+				bufs = bufs[1:]
+			} else { // wrote part of current buffer
+				bufs[0] = bufs[0][remaining:]
+				remaining = 0
+			}
+		}
 	}
-	return int(n64), err
+	return total, nil
 }
 
 func (s *tcpSession) removeStream(id uint16) {
@@ -377,6 +411,9 @@ func newTCPStream(id uint16, session *tcpSession) *tcpStream {
 	s.readCond = sync.NewCond(&s.readMu)
 	return s
 }
+
+// ID returns the stream identifier (only for TCP multiplexed streams).
+func (s *tcpStream) ID() uint16 { return s.id }
 
 func (s *tcpStream) Read(p []byte) (n int, err error) {
 	s.readMu.Lock()
@@ -457,12 +494,13 @@ func (s *tcpStream) ReadFrom(r io.Reader) (n int64, err error) {
 }
 
 func (s *tcpStream) Close() error {
+	// Modified: defer removal until remote ACKs via zero-length frame reception
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		s.writeClosed = true
 		// Send a zero-length frame to signal EOF to the other side
 		s.session.writeFrame(s.id, []byte{})
-		s.session.removeStream(s.id)
+		// Do NOT remove locally yet; removal happens when readLoop sees EOF frame from peer
 		// Wake up any blocked Read calls
 		s.readCond.Broadcast()
 	})

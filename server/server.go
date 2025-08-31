@@ -247,7 +247,7 @@ func SetupPorts(ctx context.Context, config *config.ServerConfig) error {
 		udpListener := &UDPPortListener{
 			TaggedPort: taggedPort,
 			PortMap:    portMap,
-			SourceMap:  safemap.NewSafeMap[*net.UDPAddr, *multidialer.Stream](),
+			SourceMap:  safemap.NewSafeMap[string, *multidialer.Stream](),
 		}
 		err := udpListener.Start()
 		if err != nil {

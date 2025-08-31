@@ -1,9 +1,9 @@
 package constant
 
 import (
-	"fmt"
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"neofrp/common/multidialer"
 	"net"
@@ -49,12 +49,12 @@ func (tp *TaggedPort) String() string {
 func (tp *TaggedPort) Bytes() []byte {
 	// use big endian encoding
 	switch tp.PortType {
-		case "tcp":
-			return []byte{PortTypeTCP, byte(tp.Port >> 8), byte(tp.Port & 0xFF)}
-		case "udp":
-			return []byte{PortTypeUDP, byte(tp.Port >> 8), byte(tp.Port & 0xFF)}
-		default:
-			return nil
+	case "tcp":
+		return []byte{PortTypeTCP, byte(tp.Port >> 8), byte(tp.Port & 0xFF)}
+	case "udp":
+		return []byte{PortTypeUDP, byte(tp.Port >> 8), byte(tp.Port & 0xFF)}
+	default:
+		return nil
 	}
 }
 

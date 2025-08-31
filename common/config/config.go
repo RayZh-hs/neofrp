@@ -24,18 +24,18 @@ type LogConfig struct {
 }
 
 type ClientTransportConfig struct {
-	Protocol   string `json:"protocol,omitempty"`      // "quic" or "tcp"
-	IP         string `json:"server_ip,omitempty"`     // Server IP
-	Port       int    `json:"server_port,omitempty"`   // Server Port
-	CAFile     string `json:"ca_file,omitempty"`       // Path to CA file
+	Protocol   string `json:"protocol,omitempty"`    // "quic" or "tcp"
+	IP         string `json:"server_ip,omitempty"`   // Server IP
+	Port       int    `json:"server_port,omitempty"` // Server Port
+	CAFile     string `json:"ca_file,omitempty"`     // Path to CA file
 	ServerName string `json:"server_name,omitempty"` // SNI
 }
 
 type ServerTransportConfig struct {
-	Protocol string `json:"protocol,omitempty"`    // "quic" or "tcp"
-	Port     int    `json:"port,omitempty"`        // Server Port
+	Protocol string `json:"protocol,omitempty"`  // "quic" or "tcp"
+	Port     int    `json:"port,omitempty"`      // Server Port
 	CertFile string `json:"cert_file,omitempty"` // Path to certificate file
-	KeyFile  string `json:"key_file,omitempty"`    // Path to key file
+	KeyFile  string `json:"key_file,omitempty"`  // Path to key file
 }
 
 type ServerConnectionConfig struct {

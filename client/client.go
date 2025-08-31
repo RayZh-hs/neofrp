@@ -148,6 +148,15 @@ func GetTLSConfig(config *config.ClientTransportConfig) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
+// isUseOfClosedErr returns true if error string indicates a benign closed network connection during shutdown.
+func isUseOfClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	es := err.Error()
+	return es == "use of closed network connection" || es == "EOF" || es == "stream closed" || es == "session closed"
+}
+
 func handleIncomingStreams(ctx context.Context, session multidialer.Session, config *config.ClientConfig) {
 	for {
 		select {
@@ -183,11 +192,16 @@ func handleIncomingStreams(ctx context.Context, session multidialer.Session, con
 func handleStream(ctx context.Context, stream multidialer.Stream, config *config.ClientConfig) {
 	defer stream.Close()
 
-	// Read the tagged port from the stream to know which local service to connect to
+	// Read the tagged port from the stream to know which local service to connect to.
+	// Must read exactly 3 bytes (type + 2-byte big-endian port).
 	taggedPortBytes := make([]byte, 3)
-	_, err := io.ReadFull(stream, taggedPortBytes)
-	if err != nil {
-		log.Errorf("Failed to read tagged port from stream: %v", err)
+	n, err := io.ReadFull(stream, taggedPortBytes)
+	if err != nil || n != 3 {
+		if err == io.EOF || errors.Is(err, net.ErrClosed) {
+			log.Debugf("Stream closed before header fully read (n=%d, err=%v)", n, err)
+		} else {
+			log.Errorf("Failed to read tagged port from stream (n=%d): %v", n, err)
+		}
 		return
 	}
 
@@ -199,7 +213,32 @@ func handleStream(ctx context.Context, stream multidialer.Stream, config *config
 	case C.PortTypeUDP:
 		portType = "udp"
 	default:
-		log.Errorf("Unknown port type: %d", taggedPortBytes[0])
+		// Diagnostic: attempt to read a few more bytes (non-blocking with tiny timeout via goroutine) and include stream ID if available
+		peekCh := make(chan []byte, 1)
+		go func() {
+			buf := make([]byte, 16)
+			stream.Read(buf) // best-effort; may block until data available or EOF
+			peekCh <- buf
+		}()
+		var extra []byte
+		select {
+		case b := <-peekCh:
+			extra = b
+		case <-time.After(2 * time.Millisecond):
+		}
+		if ts, ok := stream.(interface{ ID() uint16 }); ok {
+			if extra != nil {
+				log.Errorf("Unknown port type: %d streamID=%d (header=%v, peek=%x)", taggedPortBytes[0], ts.ID(), taggedPortBytes, extra)
+			} else {
+				log.Errorf("Unknown port type: %d streamID=%d (header=%v, peek timeout)", taggedPortBytes[0], ts.ID(), taggedPortBytes)
+			}
+		} else {
+			if extra != nil {
+				log.Errorf("Unknown port type: %d (header=%v, peek=%x)", taggedPortBytes[0], taggedPortBytes, extra)
+			} else {
+				log.Errorf("Unknown port type: %d (header=%v, peek timeout)", taggedPortBytes[0], taggedPortBytes)
+			}
+		}
 		return
 	}
 
@@ -249,16 +288,20 @@ func handleTCPStream(ctx context.Context, stream multidialer.Stream, localPort i
 	go func() {
 		defer cancel() // Cancel context when one direction fails
 		_, err := io.Copy(stream, localConn)
-		if err != nil {
+		if err != nil && !errors.Is(err, net.ErrClosed) && !isUseOfClosedErr(err) {
 			log.Errorf("Error copying from local to stream: %v", err)
+		} else if err != nil {
+			log.Debugf("Copy(local->stream) ended: %v", err)
 		}
 	}()
 
 	go func() {
 		defer cancel() // Cancel context when one direction fails
 		_, err := io.Copy(localConn, stream)
-		if err != nil {
+		if err != nil && !errors.Is(err, net.ErrClosed) && !isUseOfClosedErr(err) {
 			log.Errorf("Error copying from stream to local: %v", err)
+		} else if err != nil {
+			log.Debugf("Copy(stream->local) ended: %v", err)
 		}
 	}()
 

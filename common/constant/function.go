@@ -72,12 +72,12 @@ func NewBidirectionalPipePair() (*BidirectionalPipe, *BidirectionalPipe) {
 	reader1, writer1 := io.Pipe()
 	reader2, writer2 := io.Pipe()
 	return &BidirectionalPipe{
-		Reader: reader1,
-		Writer: writer2,
-	}, &BidirectionalPipe{
-		Reader: reader2,
-		Writer: writer1,
-	}
+			Reader: reader1,
+			Writer: writer2,
+		}, &BidirectionalPipe{
+			Reader: reader2,
+			Writer: writer1,
+		}
 }
 
 func (pw *BidirectionalPipe) Read(b []byte) (n int, err error) {
@@ -99,5 +99,5 @@ func (pw *BidirectionalPipe) Close() error {
 
 func IsQUICHandshake(data []byte) bool {
 	// Check if the packet contains a long header
-	return data[0] & 0xC0 == 0xC0
+	return data[0]&0xC0 == 0xC0
 }
