@@ -2,10 +2,11 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"os"
-	"slices"
+	"sync/atomic"
 	"time"
 
 	"neofrp/common/config"
@@ -29,21 +30,54 @@ func NewControlHandler(config *config.ServerConfig, conn multidialer.Stream) *Co
 }
 
 func (h *ControlHandler) Handshake() error {
-	buff := make([]byte, 1)
-	io.ReadFull(h.conn, buff)
-	// Verify the version number
-	if buff[0] != C.Version {
+	// Read version byte
+	version := make([]byte, 1)
+	if _, err := io.ReadFull(h.conn, version); err != nil {
+		// Can't even read version: abort silently (no partial protocol state)
 		h.conn.Write([]byte{P.ReturnCodeOtherError})
-		return fmt.Errorf("unsupported version: %d", buff[0])
+		return fmt.Errorf("handshake: failed reading version: %w", err)
 	}
-	// Validate the token
-	io.ReadFull(h.conn, buff)
-	n := uint8(buff[0])
-	buff = make([]byte, n)
-	io.ReadFull(h.conn, buff)
-	if !slices.Contains(h.config.RecognizedTokens, string(buff)) {
+	if version[0] != C.Version {
+		h.conn.Write([]byte{P.ReturnCodeOtherError})
+		return fmt.Errorf("handshake: unsupported version: %d", version[0])
+	}
+
+	// Read token length (1 byte)
+	lnBuf := make([]byte, 1)
+	if _, err := io.ReadFull(h.conn, lnBuf); err != nil {
+		h.conn.Write([]byte{P.ReturnCodeOtherError})
+		return fmt.Errorf("handshake: failed reading token length: %w", err)
+	}
+	tokenLen := int(lnBuf[0])
+	if tokenLen == 0 {
 		h.conn.Write([]byte{P.ReturnCodeUnrecognizedToken})
-		return fmt.Errorf("unrecognized token: %s", string(buff))
+		return fmt.Errorf("handshake: empty token rejected")
+	}
+	if tokenLen > 255 { // defensive (uint8 already bounds this)
+		h.conn.Write([]byte{P.ReturnCodeOtherError})
+		return fmt.Errorf("handshake: unreasonable token length %d", tokenLen)
+	}
+	tokenBytes := make([]byte, tokenLen)
+	if _, err := io.ReadFull(h.conn, tokenBytes); err != nil {
+		h.conn.Write([]byte{P.ReturnCodeOtherError})
+		return fmt.Errorf("handshake: failed reading token: %w", err)
+	}
+
+	// Constant-time comparison against recognized tokens to reduce timing side-channel
+	authorized := false
+	for _, t := range h.config.RecognizedTokens {
+		if len(t) != len(tokenBytes) {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(t), tokenBytes) == 1 {
+			authorized = true
+			break
+		}
+	}
+	if !authorized {
+		h.conn.Write([]byte{P.ReturnCodeUnrecognizedToken})
+		// Do not echo token value in log to avoid secret leakage
+		return fmt.Errorf("handshake: unrecognized token (len=%d)", len(tokenBytes))
 	}
 	return nil
 }
@@ -77,6 +111,15 @@ func (h *ControlHandler) Negotiate() error {
 		return fmt.Errorf("failed to read port data: %v", err)
 	}
 
+	containsPort := func(list []C.PortType, v C.PortType) bool {
+		for _, p := range list {
+			if p == v {
+				return true
+			}
+		}
+		return false
+	}
+
 	// Parse the port requests and check availability
 	responses := make([]byte, length)
 	for i := 0; i < length; i++ {
@@ -87,9 +130,9 @@ func (h *ControlHandler) Negotiate() error {
 		isAvailable := false
 		switch portType {
 		case C.PortTypeTCP:
-			isAvailable = slices.Contains(h.config.ConnectionConfig.TCPPorts, C.PortType(port))
+			isAvailable = containsPort(h.config.ConnectionConfig.TCPPorts, C.PortType(port))
 		case C.PortTypeUDP:
-			isAvailable = slices.Contains(h.config.ConnectionConfig.UDPPorts, C.PortType(port))
+			isAvailable = containsPort(h.config.ConnectionConfig.UDPPorts, C.PortType(port))
 		}
 
 		if isAvailable {
@@ -170,6 +213,9 @@ func RunControlLoop(ctx context.Context, controlConn multidialer.Stream, session
 		}
 	}()
 
+	var lastKA atomic.Int64
+	lastKA.Store(time.Now().UnixNano())
+
 	// Setup keepalive monitoring
 	go func() {
 		ticker := time.NewTicker(C.KeepAliveTimeout)
@@ -179,10 +225,9 @@ func RunControlLoop(ctx context.Context, controlConn multidialer.Stream, session
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				lastKeepAlive := ctx.Value(C.ContextLastKeepAliveKey)
-				if lastKeepAlive == nil || time.Since(lastKeepAlive.(time.Time)) > C.KeepAliveTimeout {
+				last := time.Unix(0, lastKA.Load())
+				if time.Since(last) > C.KeepAliveTimeout {
 					log.Warnf("No keep-alive received in the last %v, closing connection", C.KeepAliveTimeout)
-					// Close the connection to the server
 					CancelConnection(ctx)
 					return
 				}
@@ -201,8 +246,7 @@ func RunControlLoop(ctx context.Context, controlConn multidialer.Stream, session
 			log.Debugf("Received control message: %v", msg)
 			switch msg[0] {
 			case P.ActionKeepAlive:
-				// Update last recorded keep-alive time
-				ctx = context.WithValue(ctx, C.ContextLastKeepAliveKey, time.Now())
+				lastKA.Store(time.Now().UnixNano())
 			case P.ActionClose:
 				log.Infof("Received active close action from client, closing connection")
 				CancelConnection(ctx)

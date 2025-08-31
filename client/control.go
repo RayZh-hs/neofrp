@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"neofrp/common/config"
@@ -29,15 +30,19 @@ func NewControlHandler(config *config.ClientConfig, controlStream multidialer.St
 }
 
 func (h *ControlHandler) Handshake() error {
-	msg := []byte{C.Version, byte(len(h.Config.Token))}
-	msg = append(msg, []byte(h.Config.Token)...)
-	_, err := h.ControlStream.Write(msg)
-	if err != nil {
-		return err
+	tokenLen := len(h.Config.Token)
+	if tokenLen == 0 || tokenLen > 255 {
+		return fmt.Errorf("invalid token length %d", tokenLen)
 	}
-	// Read the response from the server
+	msg := []byte{C.Version, byte(tokenLen)}
+	msg = append(msg, []byte(h.Config.Token)...)
+	if _, err := h.ControlStream.Write(msg); err != nil {
+		return fmt.Errorf("handshake write failed: %w", err)
+	}
 	response := make([]byte, 1)
-	io.ReadFull(h.ControlStream, response)
+	if _, err := io.ReadFull(h.ControlStream, response); err != nil {
+		return fmt.Errorf("handshake read failed: %w", err)
+	}
 	switch response[0] {
 	case P.ReturnCodeAccepted:
 		return nil
@@ -130,19 +135,18 @@ func CancelConnection(ctx context.Context, controlConn multidialer.Stream) {
 	log.Debug("Sending active close signal to server")
 	controlConn.Write([]byte{P.ActionClose})
 	time.Sleep(100 * time.Millisecond)
-	cancelChan := ctx.Value(C.ContextSignalChanKey).(chan os.Signal)
-	if cancelChan != nil {
-		log.Debug("Sending interrupt signal to cancel connection")
-		select {
-		case cancelChan <- os.Interrupt:
-			// Signal sent successfully
-		default:
-			// Channel is full or closed, ignore
-			log.Debug("Cancel channel is full or closed, skipping signal")
+	if v := ctx.Value(C.ContextSignalChanKey); v != nil {
+		if cancelChan, ok := v.(chan os.Signal); ok && cancelChan != nil {
+			log.Debug("Sending interrupt signal to cancel connection")
+			select {
+			case cancelChan <- os.Interrupt:
+			default:
+				log.Debug("Cancel channel is full or closed, skipping signal")
+			}
+			return
 		}
-	} else {
-		log.Warn("No cancel channel found in context, cannot send interrupt signal")
 	}
+	log.Warn("No cancel channel found in context, cannot send interrupt signal")
 }
 
 func RunControlLoop(ctx context.Context, controlConn multidialer.Stream, session multidialer.Session, config *config.ClientConfig) {
@@ -185,7 +189,9 @@ func RunControlLoop(ctx context.Context, controlConn multidialer.Stream, session
 		}
 	}()
 
-	// Setup keepalive monitoring
+	// Atomic keep-alive tracking to avoid context layering leak
+	var lastKA atomic.Int64
+	lastKA.Store(time.Now().UnixNano())
 	go func() {
 		ticker := time.NewTicker(C.KeepAliveTimeout)
 		defer ticker.Stop()
@@ -194,10 +200,9 @@ func RunControlLoop(ctx context.Context, controlConn multidialer.Stream, session
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				lastKeepAlive := ctx.Value(C.ContextLastKeepAliveKey)
-				if lastKeepAlive == nil || time.Since(lastKeepAlive.(time.Time)) > C.KeepAliveTimeout {
+				last := time.Unix(0, lastKA.Load())
+				if time.Since(last) > C.KeepAliveTimeout {
 					log.Warnf("No keep-alive received in the last %v, closing connection", C.KeepAliveTimeout)
-					// Close the connection to the server
 					CancelConnection(ctx, controlConn)
 					return
 				}
@@ -216,8 +221,7 @@ func RunControlLoop(ctx context.Context, controlConn multidialer.Stream, session
 			log.Debugf("Received control message: %v", msg)
 			switch msg[0] {
 			case P.ActionKeepAlive:
-				// Update last recorded keep-alive time
-				ctx = context.WithValue(ctx, C.ContextLastKeepAliveKey, time.Now())
+				lastKA.Store(time.Now().UnixNano())
 			case P.ActionClose:
 				log.Infof("Received active close action from server, closing connection")
 				CancelConnection(ctx, controlConn)

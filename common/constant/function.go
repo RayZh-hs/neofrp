@@ -98,6 +98,8 @@ func (pw *BidirectionalPipe) Close() error {
 }
 
 func IsQUICHandshake(data []byte) bool {
-	// Check if the packet contains a long header
+	if len(data) == 0 {
+		return false
+	}
 	return data[0]&0xC0 == 0xC0
 }

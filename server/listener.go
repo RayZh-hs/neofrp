@@ -195,6 +195,7 @@ func (l *UDPPortListener) Start() error {
 				}
 				if element == nil {
 					log.Warnf("No valid session element found for port %s, ignoring data from %s", l.TaggedPort.String(), addr.String())
+					l.mutex.Unlock()
 					continue
 				}
 				comp := element.Value.(*C.SessionIndexCompound)

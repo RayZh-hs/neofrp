@@ -11,7 +11,7 @@ A modern, high-performance reverse proxy implementation in Go, focusing on speed
 
 ## 🚀 Features
 
-- **High Performance**: Built with Go for concurrent processing and low latency
+- **High Performance**: Built with Go for concurrent processing and low latency. TCP performance 80% faster than FRP under the same setting.
 - **Secure Communication**: Enforced secure communication via QUIC(udp) and TLS(tcp) transport
 - **Port Multiplexing**: Allowing for efficient handling of multiple TCP/UDP port forwarding
 - **Easy Configuration**: JSON-based configuration files

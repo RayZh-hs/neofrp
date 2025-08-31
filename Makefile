@@ -18,6 +18,18 @@ BIN_DIR=bin
 
 all: build
 
+# Hardened production build (stripped, trimmed) - set via: make build-prod
+build-prod: $(SERVER_GO_FILES) $(CLIENT_GO_FILES)
+	@mkdir -p $(BIN_DIR)
+	$(GOBUILD) -trimpath -ldflags "-s -w" -buildvcs=false -o $(BIN_DIR)/$(SERVER_BINARY) ./cmd/server
+	$(GOBUILD) -trimpath -ldflags "-s -w" -buildvcs=false -o $(BIN_DIR)/$(CLIENT_BINARY) ./cmd/client
+
+# Race build for testing (not for production)
+build-race: $(SERVER_GO_FILES) $(CLIENT_GO_FILES)
+	@mkdir -p $(BIN_DIR)
+	$(GOBUILD) -race -o $(BIN_DIR)/$(SERVER_BINARY)-race ./cmd/server
+	$(GOBUILD) -race -o $(BIN_DIR)/$(CLIENT_BINARY)-race ./cmd/client
+
 build: $(BIN_DIR)/$(SERVER_BINARY) $(BIN_DIR)/$(CLIENT_BINARY)
 
 $(BIN_DIR)/$(SERVER_BINARY): $(SERVER_GO_FILES)
