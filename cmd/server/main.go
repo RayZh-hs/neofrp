@@ -43,5 +43,5 @@ func main() {
 	}
 
 	// Run the server service
-	server.Run(config)
+	server.Run(config, configFile)
 }

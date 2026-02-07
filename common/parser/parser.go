@@ -112,8 +112,27 @@ func ValidateServerConfig(config *config.ServerConfig) error {
 	if config.TransportConfig.Port == 0 || config.TransportConfig.Port > 65535 {
 		return fmt.Errorf("server port must be between 1 and 65535")
 	}
-	if len(config.RecognizedTokens) == 0 {
-		return fmt.Errorf("at least one recognized token is required for the server to start")
+	// Check that at least one token is configured (either global or per-port)
+	hasTokens := len(config.RecognizedTokens) > 0
+	if !hasTokens {
+		// Check for per-port tokens
+		for _, pc := range config.ConnectionConfig.TCPPorts {
+			if len(pc.Tokens) > 0 {
+				hasTokens = true
+				break
+			}
+		}
+	}
+	if !hasTokens {
+		for _, pc := range config.ConnectionConfig.UDPPorts {
+			if len(pc.Tokens) > 0 {
+				hasTokens = true
+				break
+			}
+		}
+	}
+	if !hasTokens {
+		return fmt.Errorf("at least one token is required (either in recognized_tokens or per-port tokens)")
 	}
 	if (config.TransportConfig.CertFile != "" && config.TransportConfig.KeyFile == "") || (config.TransportConfig.CertFile == "" && config.TransportConfig.KeyFile != "") {
 		return fmt.Errorf("cert_file and key_file must be provided together")
@@ -128,13 +147,13 @@ func ValidateServerConfig(config *config.ServerConfig) error {
 			return fmt.Errorf("key_file not found: %s", config.TransportConfig.KeyFile)
 		}
 	}
-	for i, port := range config.ConnectionConfig.TCPPorts {
-		if port == 0 || port > 65535 {
+	for i, pc := range config.ConnectionConfig.TCPPorts {
+		if pc.Port == 0 || pc.Port > 65535 {
 			return fmt.Errorf("tcp_ports[%d]: port must be between 1 and 65535", i)
 		}
 	}
-	for i, port := range config.ConnectionConfig.UDPPorts {
-		if port == 0 || port > 65535 {
+	for i, pc := range config.ConnectionConfig.UDPPorts {
+		if pc.Port == 0 || pc.Port > 65535 {
 			return fmt.Errorf("udp_ports[%d]: port must be between 1 and 65535", i)
 		}
 	}

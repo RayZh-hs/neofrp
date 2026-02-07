@@ -128,13 +128,51 @@ You can forward any local port, TCP or UDP, by editing the `client.json` file an
 | Field | Type | Description | Default |
 |-------|------|-------------|---------|
 | `log.log_level` | string | Logging level (debug, info, warn, error, fatal) | "info" |
-| `recognized_tokens` | array | List of valid client tokens | [] |
+| `recognized_tokens` | array | List of valid client tokens (global access to all ports) | [] |
 | `transport.protocol` | string | Transport protocol ("quic" or "tcp") | "quic" |
 | `transport.port` | number | Server listening port | Required |
 | `transport.cert_file` | string | Path to TLS certificate file | (self-signed) |
 | `transport.key_file` | string | Path to TLS key file | (self-signed) |
-| `connections.tcp_ports` | array | TCP ports to expose | [] |
-| `connections.udp_ports` | array | UDP ports to expose | [] |
+| `connections.tcp_ports` | array | TCP ports to expose (can be numbers or objects with per-port tokens) | [] |
+| `connections.udp_ports` | array | UDP ports to expose (can be numbers or objects with per-port tokens) | [] |
+
+#### Per-Port Token Authentication
+
+For enhanced security, you can assign specific tokens to specific ports. This prevents clients with different tokens from accessing each other's ports:
+
+```json
+{
+    "recognized_tokens": [],
+    "connections": {
+        "tcp_ports": [
+            { "port": 35560, "tokens": ["user_a_token"] },
+            { "port": 35561, "tokens": ["user_b_token"] },
+            35562
+        ]
+    }
+}
+```
+
+- Tokens in `recognized_tokens` (global tokens) have access to **all** ports
+- Per-port tokens only grant access to their specific port
+- Ports without tokens (legacy format) are accessible by any authenticated user
+- Both formats can be mixed in the same config
+
+#### Hot Reload
+
+The server automatically watches the config file and reloads when changes are detected. You can also manually trigger a reload:
+
+```bash
+kill -SIGHUP $(pgrep frps)
+```
+
+**What gets reloaded:**
+- Tokens (both global and per-port)
+- Port access rules
+
+**What requires restart:**
+- Transport settings (protocol, port, certificates)
+- Adding/removing port listeners
 
 You can use templating to register a range of ports:
 
