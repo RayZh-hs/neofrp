@@ -25,7 +25,9 @@ import (
 
 func Run(config *config.ClientConfig) {
 	// Initialize the client service with the provided configuration
-	log.Debugf("Run using config: %+v", config)
+	log.Debugf("Run using config (token redacted): protocol=%s server=%s:%d connections=%d",
+		config.TransportConfig.Protocol, config.TransportConfig.IP,
+		config.TransportConfig.Port, len(config.ConnectionConfigs))
 	// First create the master connection to the server
 	tlsConfig, err := GetTLSConfig(&config.TransportConfig)
 	if err != nil {
@@ -55,6 +57,7 @@ func Run(config *config.ClientConfig) {
 		log.Errorf("Failed to open control stream: %v", err)
 		return
 	}
+	defer controlConn.Close()
 
 	controlHandler := NewControlHandler(config, controlConn)
 	err = controlHandler.Handshake()
@@ -335,7 +338,7 @@ func handleUDPStream(ctx context.Context, stream multidialer.Stream, localPort i
 	// Handle stream to local UDP (server -> client -> local service)
 	go func() {
 		defer cancel()
-		buffer := make([]byte, 4096)
+		buffer := make([]byte, 65535) // Full UDP datagram size
 		for {
 			select {
 			case <-connCtx.Done():
@@ -362,7 +365,7 @@ func handleUDPStream(ctx context.Context, stream multidialer.Stream, localPort i
 	// Handle local UDP to stream (local service -> client -> server)
 	go func() {
 		defer cancel()
-		buffer := make([]byte, 4096)
+		buffer := make([]byte, 65535) // Full UDP datagram size
 		for {
 			select {
 			case <-connCtx.Done():

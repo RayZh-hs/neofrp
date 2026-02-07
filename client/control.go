@@ -62,26 +62,25 @@ func (h *ControlHandler) Negotiate() error {
 	// [LENGTH] [DATA] where DATA is []struct { [TYPE] [PORT] }
 	var portData []byte
 
-	// Add TCP ports
+	// Send ports in ConnectionConfigs order so that response indices match
 	for _, connConfig := range h.Config.ConnectionConfigs {
-		if connConfig.Type == "tcp" {
+		switch connConfig.Type {
+		case "tcp":
 			portData = append(portData, C.PortTypeTCP)
-			portData = append(portData, byte(connConfig.ServerPort>>8))
-			portData = append(portData, byte(connConfig.ServerPort&0xFF))
-		}
-	}
-
-	// Add UDP ports
-	for _, connConfig := range h.Config.ConnectionConfigs {
-		if connConfig.Type == "udp" {
+		case "udp":
 			portData = append(portData, C.PortTypeUDP)
-			portData = append(portData, byte(connConfig.ServerPort>>8))
-			portData = append(portData, byte(connConfig.ServerPort&0xFF))
+		default:
+			continue
 		}
+		portData = append(portData, byte(connConfig.ServerPort>>8))
+		portData = append(portData, byte(connConfig.ServerPort&0xFF))
 	}
 
 	// Send the port configuration
 	length := len(portData) / 3 // Each port entry is 3 bytes
+	if length > 255 {
+		return fmt.Errorf("too many port configurations (%d), maximum is 255", length)
+	}
 	msg := append([]byte{byte(length)}, portData...)
 	_, err := h.ControlStream.Write(msg)
 	if err != nil {
@@ -107,9 +106,12 @@ func (h *ControlHandler) Negotiate() error {
 		return fmt.Errorf("failed to read port responses: %v", err)
 	}
 
-	// Check responses
+	// Check responses — iterate in the same order as sent
 	portIndex := 0
 	for _, connConfig := range h.Config.ConnectionConfigs {
+		if connConfig.Type != "tcp" && connConfig.Type != "udp" {
+			continue
+		}
 		if portIndex >= len(responses) {
 			break
 		}

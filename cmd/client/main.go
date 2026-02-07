@@ -35,11 +35,11 @@ func main() {
 
 	log.Infof("Parsed client config")
 	logLevel := config.LogConfig.LogLevel
-	if logLevel == "" || C.LogLevelMap[logLevel] == 0 {
-		log.Warnf("Using default log level INFO")
-		log.SetLevel(log.InfoLevel)
+	if level, ok := C.LogLevelMap[logLevel]; ok {
+		log.SetLevel(level)
 	} else {
-		log.SetLevel(C.LogLevelMap[logLevel])
+		log.Warnf("Unknown log level %q, using default INFO", logLevel)
+		log.SetLevel(log.InfoLevel)
 	}
 
 	// Run the client service

@@ -26,8 +26,9 @@ const (
 )
 
 var (
-	ErrSessionClosed = errors.New("session closed")
-	ErrStreamClosed  = errors.New("stream closed")
+	ErrSessionClosed  = errors.New("session closed")
+	ErrStreamClosed   = errors.New("stream closed")
+	ErrStreamIDsExhausted = errors.New("stream IDs exhausted")
 )
 
 // It can be a QUIC stream or an emulated stream over TCP.
@@ -220,7 +221,12 @@ func (s *tcpSession) OpenStream(ctx context.Context) (Stream, error) {
 
 	// Atomically get the next available ID for our role (odd/even)
 	id := atomic.AddUint32(&s.nextStreamID, 2)
-	stream := newTCPStream(uint16(id-2), s) // use the ID before incrementing
+	actualID := id - 2
+	// Check for uint16 overflow — stream IDs are 16-bit
+	if actualID > 65535 {
+		return nil, ErrStreamIDsExhausted
+	}
+	stream := newTCPStream(uint16(actualID), s)
 	s.streams.Store(stream.id, stream)
 
 	return stream, nil
@@ -356,30 +362,16 @@ func (s *tcpSession) writeFrame(id uint16, data []byte) (int, error) {
 	binary.BigEndian.PutUint16(header[0:2], id)
 	binary.BigEndian.PutUint16(header[2:4], uint16(len(data)))
 
-	// Use net.Buffers to leverage writev. We MUST handle partial writes.
+	// Use net.Buffers to leverage writev. WriteTo modifies the receiver
+	// in place, consuming written data automatically.
 	bufs := net.Buffers{header[:], data}
-	total := 0
-	for len(bufs) > 0 {
-		n64, err := bufs.WriteTo(s.conn)
-		total += int(n64)
-		if err != nil {
-			// Close session on write failure to propagate error to all streams.
-			s.Close(err)
-			return total, err
-		}
-		// Trim written bytes from bufs (partial write handling)
-		remaining := int(n64)
-		for remaining > 0 && len(bufs) > 0 {
-			if remaining >= len(bufs[0]) {
-				remaining -= len(bufs[0])
-				bufs = bufs[1:]
-			} else { // wrote part of current buffer
-				bufs[0] = bufs[0][remaining:]
-				remaining = 0
-			}
-		}
+	n64, err := bufs.WriteTo(s.conn)
+	if err != nil {
+		// Close session on write failure to propagate error to all streams.
+		s.Close(err)
+		return int(n64), err
 	}
-	return total, nil
+	return int(n64), nil
 }
 
 func (s *tcpSession) removeStream(id uint16) {
@@ -397,7 +389,7 @@ type tcpStream struct {
 	// State management
 	closeOnce   sync.Once
 	closed      chan struct{}
-	writeClosed bool
+	writeClosed atomic.Bool
 	readErr     error // Error to return on subsequent reads after close
 }
 
@@ -436,7 +428,7 @@ func (s *tcpStream) Read(p []byte) (n int, err error) {
 }
 
 func (s *tcpStream) Write(p []byte) (n int, err error) {
-	if s.writeClosed {
+	if s.writeClosed.Load() {
 		return 0, ErrStreamClosed
 	}
 
@@ -465,7 +457,7 @@ func (s *tcpStream) Write(p []byte) (n int, err error) {
 // It batches reads from r into a reusable buffer and writes frames without
 // the additional overhead of intermediate io.Copy 32KB allocations.
 func (s *tcpStream) ReadFrom(r io.Reader) (n int64, err error) {
-	if s.writeClosed {
+	if s.writeClosed.Load() {
 		return 0, ErrStreamClosed
 	}
 	// 1MB buffer strikes a balance between syscall overhead and memory usage.
@@ -473,7 +465,7 @@ func (s *tcpStream) ReadFrom(r io.Reader) (n int64, err error) {
 	for {
 		nr, er := r.Read(buf)
 		if nr > 0 {
-			if s.writeClosed {
+			if s.writeClosed.Load() {
 				return n, ErrStreamClosed
 			}
 			// Write may chunk internally to MaxPayloadSize.
@@ -497,7 +489,7 @@ func (s *tcpStream) Close() error {
 	// Modified: defer removal until remote ACKs via zero-length frame reception
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		s.writeClosed = true
+		s.writeClosed.Store(true)
 		// Send a zero-length frame to signal EOF to the other side
 		s.session.writeFrame(s.id, []byte{})
 		// Do NOT remove locally yet; removal happens when readLoop sees EOF frame from peer
@@ -531,7 +523,7 @@ func (s *tcpStream) sessionClosed(err error) {
 	if s.readErr == nil {
 		s.readErr = err
 	}
-	s.writeClosed = true
+	s.writeClosed.Store(true)
 	s.readCond.Broadcast() // Wake up any readers
 }
 

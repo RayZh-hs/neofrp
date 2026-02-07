@@ -3,10 +3,12 @@ package constant
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"fmt"
 	"io"
 	"neofrp/common/multidialer"
 	"net"
+	"sync"
 )
 
 // BufferReadWriteCloser is a struct that implements the io.ReadWriteCloser interface
@@ -59,3 +61,64 @@ func (tp *TaggedPort) Bytes() []byte {
 }
 
 type ContextKeyType byte
+
+// SessionList is a thread-safe wrapper around container/list.List.
+// All operations on the underlying list must go through SessionList methods
+// to avoid data races between port listeners and session management.
+type SessionList struct {
+	mu   sync.Mutex
+	list *list.List
+}
+
+func NewSessionList() *SessionList {
+	return &SessionList{list: list.New()}
+}
+
+func (sl *SessionList) PushBack(v interface{}) *list.Element {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	return sl.list.PushBack(v)
+}
+
+func (sl *SessionList) Remove(e *list.Element) interface{} {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	return sl.list.Remove(e)
+}
+
+func (sl *SessionList) Len() int {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	return sl.list.Len()
+}
+
+// RoundRobin picks the next session using round-robin and returns the
+// SessionIndexCompound. It holds the lock for the entire pick operation
+// so that the list cannot be modified mid-iteration. nextIdx is updated
+// in place to track position across calls.
+func (sl *SessionList) RoundRobin(nextIdx *int) *SessionIndexCompound {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+
+	if sl.list.Len() == 0 {
+		return nil
+	}
+	if *nextIdx >= sl.list.Len() {
+		*nextIdx = 0
+	}
+	element := sl.list.Front()
+	for i := 0; i < *nextIdx; i++ {
+		if element == nil {
+			*nextIdx = 0
+			element = sl.list.Front()
+			break
+		}
+		element = element.Next()
+	}
+	if element == nil {
+		return nil
+	}
+	comp := element.Value.(*SessionIndexCompound)
+	*nextIdx++
+	return comp
+}

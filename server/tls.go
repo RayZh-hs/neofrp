@@ -15,21 +15,20 @@ import (
 )
 
 func GetTLSConfig(cfg *config.ServerTransportConfig) (*tls.Config, error) {
+	var cert tls.Certificate
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		var err error
+		cert, err = tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load x509 key pair: %v", err)
 		}
-		return &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}, nil
-	}
-
-	// Generate a self-signed certificate for the server
-	cert, err := generateSelfSignedCert()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate self-signed certificate: %v", err)
+	} else {
+		// Generate a self-signed certificate for the server
+		var err error
+		cert, err = generateSelfSignedCert()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate self-signed certificate: %v", err)
+		}
 	}
 
 	tlsConfig := &tls.Config{
@@ -51,9 +50,16 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 
+	// Generate a cryptographically random serial number (RFC 5280 requires uniqueness)
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("failed to generate serial number: %v", err)
+	}
+
 	// Create certificate template
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization:  []string{"FRP"},
 			Country:       []string{"US"},

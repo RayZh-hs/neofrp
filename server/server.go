@@ -20,7 +20,9 @@ import (
 
 // Run initializes the server service with the provided configuration
 func Run(config *config.ServerConfig) {
-	log.Debugf("Run using config: %+v", config)
+	log.Debugf("Run using config (tokens redacted): protocol=%s port=%d tcp_ports=%v udp_ports=%v",
+		config.TransportConfig.Protocol, config.TransportConfig.Port,
+		config.ConnectionConfig.TCPPorts, config.ConnectionConfig.UDPPorts)
 	tlsConfig, err := GetTLSConfig(&config.TransportConfig)
 	if err != nil {
 		log.Errorf("Failed to get TLS config: %v", err)
@@ -31,10 +33,10 @@ func Run(config *config.ServerConfig) {
 	defer cancel()
 
 	// Register the portmap into ctx
-	ctx = context.WithValue(ctx, C.ContextPortMapKey, safemap.NewSafeMap[C.TaggedPort, *list.List]())
+	ctx = context.WithValue(ctx, C.ContextPortMapKey, safemap.NewSafeMap[C.TaggedPort, *C.SessionList]())
 
-	// Setup all the ports
-	err = SetupPorts(ctx, config)
+	// Setup all the ports; collect closers for graceful shutdown
+	portClosers, err := SetupPorts(ctx, config)
 	if err != nil {
 		log.Errorf("Failed to setup ports: %v", err)
 		return
@@ -84,6 +86,12 @@ func Run(config *config.ServerConfig) {
 
 	log.Infof("Received shutdown signal, stopping server...")
 	cancel()
+
+	// Close all port listeners so their goroutines can exit
+	for _, closer := range portClosers {
+		closer()
+	}
+
 	wg.Wait()
 	log.Infof("Server stopped gracefully")
 }
@@ -96,8 +104,36 @@ func handleSession(ctx context.Context, wg *sync.WaitGroup, config *config.Serve
 	sessionCtx = context.WithValue(sessionCtx, C.ContextSessionCancelKey, sessionCancel)
 	defer sessionCancel()
 
-	// Cleanup function to ensure resources are properly released
+	// Track registered elements for cleanup
+	type portElement struct {
+		taggedPort C.TaggedPort
+		element    *list.Element
+	}
+	var registered []portElement
+
+	portMap := ctx.Value(C.ContextPortMapKey).(*safemap.SafeMap[C.TaggedPort, *C.SessionList])
+
+	// Cleanup function to ensure resources are properly released.
+	// Runs on ALL exit paths (including negotiate failure).
 	defer func() {
+		// Clean up session from portmap
+		if portMap != nil {
+			for _, pe := range registered {
+				if sl, ok := portMap.Get(pe.taggedPort); ok {
+					sl.Remove(pe.element)
+					log.Infof("Unregistered session %s from %s", session.RemoteAddr(), pe.taggedPort.String())
+				}
+			}
+		}
+
+		// Close the session gracefully
+		err := session.Close(fmt.Errorf("session closed by server"))
+		if err != nil {
+			log.Errorf("Failed to close session: %v", err)
+		} else {
+			log.Infof("Session %s closed successfully", session.RemoteAddr())
+		}
+
 		log.Infof("Session cleanup completed for %s", session.RemoteAddr())
 	}()
 
@@ -118,8 +154,13 @@ func handleSession(ctx context.Context, wg *sync.WaitGroup, config *config.Serve
 	}
 	log.Infof("Handshake successful with client %s", session.RemoteAddr())
 
-	// Register this session in the portmap for all configured ports
-	portMap := ctx.Value(C.ContextPortMapKey).(*safemap.SafeMap[C.TaggedPort, *list.List])
+	err = controlHandler.Negotiate()
+	if err != nil {
+		log.Errorf("Negotiation failed: %v", err)
+		return
+	}
+
+	// Register this session in the portmap AFTER successful negotiation
 	if portMap != nil {
 		// Register session for TCP ports
 		for _, port := range config.ConnectionConfig.TCPPorts {
@@ -127,13 +168,13 @@ func handleSession(ctx context.Context, wg *sync.WaitGroup, config *config.Serve
 				PortType: "tcp",
 				Port:     C.PortType(port),
 			}
-			if l, ok := portMap.Get(taggedPort); ok {
+			if sl, ok := portMap.Get(taggedPort); ok {
 				sessionIndex := &C.SessionIndexCompound{
 					Session: &session,
 					Index:   0,
 				}
-				element := l.PushBack(sessionIndex)
-				sessionCtx = context.WithValue(sessionCtx, fmt.Sprintf("tcp-%d", port), element)
+				element := sl.PushBack(sessionIndex)
+				registered = append(registered, portElement{taggedPort: taggedPort, element: element})
 				log.Infof("Registered session %s for TCP port %d", session.RemoteAddr(), port)
 			}
 		}
@@ -144,22 +185,16 @@ func handleSession(ctx context.Context, wg *sync.WaitGroup, config *config.Serve
 				PortType: "udp",
 				Port:     C.PortType(port),
 			}
-			if l, ok := portMap.Get(taggedPort); ok {
+			if sl, ok := portMap.Get(taggedPort); ok {
 				sessionIndex := &C.SessionIndexCompound{
 					Session: &session,
 					Index:   0,
 				}
-				element := l.PushBack(sessionIndex)
-				sessionCtx = context.WithValue(sessionCtx, fmt.Sprintf("udp-%d", port), element)
+				element := sl.PushBack(sessionIndex)
+				registered = append(registered, portElement{taggedPort: taggedPort, element: element})
 				log.Infof("Registered session %s for UDP port %d", session.RemoteAddr(), port)
 			}
 		}
-	}
-
-	err = controlHandler.Negotiate()
-	if err != nil {
-		log.Errorf("Negotiation failed: %v", err)
-		return
 	}
 
 	// Setup the control feedback loop
@@ -168,51 +203,14 @@ func handleSession(ctx context.Context, wg *sync.WaitGroup, config *config.Serve
 	// Wait for cancellation signal
 	<-sessionCtx.Done()
 	log.Infof("Closing session %s due to context cancellation", session.RemoteAddr())
-
-	// Clean up session from portmap
-	if portMap != nil {
-		// Remove session from TCP ports
-		for _, port := range config.ConnectionConfig.TCPPorts {
-			taggedPort := C.TaggedPort{
-				PortType: "tcp",
-				Port:     C.PortType(port),
-			}
-			if l, ok := portMap.Get(taggedPort); ok {
-				if element, ok := sessionCtx.Value(fmt.Sprintf("tcp-%d", port)).(*list.Element); ok {
-					l.Remove(element)
-					log.Infof("Unregistered session %s from TCP port %d", session.RemoteAddr(), port)
-				}
-			}
-		}
-
-		// Remove session from UDP ports
-		for _, port := range config.ConnectionConfig.UDPPorts {
-			taggedPort := C.TaggedPort{
-				PortType: "udp",
-				Port:     C.PortType(port),
-			}
-			if l, ok := portMap.Get(taggedPort); ok {
-				if element, ok := sessionCtx.Value(fmt.Sprintf("udp-%d", port)).(*list.Element); ok {
-					l.Remove(element)
-					log.Infof("Unregistered session %s from UDP port %d", session.RemoteAddr(), port)
-				}
-			}
-		}
-	}
-
-	// Close the session gracefully
-	err = session.Close(fmt.Errorf("session closed by server"))
-	if err != nil {
-		log.Errorf("Failed to close session: %v", err)
-	} else {
-		log.Infof("Session %s closed successfully", session.RemoteAddr())
-	}
 }
 
-func SetupPorts(ctx context.Context, config *config.ServerConfig) error {
-	portMap := ctx.Value(C.ContextPortMapKey).(*safemap.SafeMap[C.TaggedPort, *list.List])
+// SetupPorts creates and starts port listeners. Returns a slice of closer
+// functions that should be called on shutdown to stop the listener goroutines.
+func SetupPorts(ctx context.Context, config *config.ServerConfig) (closers []func(), err error) {
+	portMap := ctx.Value(C.ContextPortMapKey).(*safemap.SafeMap[C.TaggedPort, *C.SessionList])
 	if portMap == nil {
-		return fmt.Errorf("portmap not found in context")
+		return nil, fmt.Errorf("portmap not found in context")
 	}
 
 	// Setup TCP ports
@@ -221,17 +219,18 @@ func SetupPorts(ctx context.Context, config *config.ServerConfig) error {
 			PortType: "tcp",
 			Port:     C.PortType(port),
 		}
-		portMap.Set(taggedPort, list.New())
+		portMap.Set(taggedPort, C.NewSessionList())
 
 		// Create and start TCP listener
 		tcpListener := &TCPPortListener{
 			TaggedPort: taggedPort,
 			PortMap:    portMap,
 		}
-		err := tcpListener.Start()
-		if err != nil {
-			return fmt.Errorf("failed to start TCP listener for port %d: %v", port, err)
+		closer, startErr := tcpListener.Start(ctx)
+		if startErr != nil {
+			return nil, fmt.Errorf("failed to start TCP listener for port %d: %v", port, startErr)
 		}
+		closers = append(closers, closer)
 		log.Infof("Started TCP listener for port %d", port)
 	}
 
@@ -241,7 +240,7 @@ func SetupPorts(ctx context.Context, config *config.ServerConfig) error {
 			PortType: "udp",
 			Port:     C.PortType(port),
 		}
-		portMap.Set(taggedPort, list.New())
+		portMap.Set(taggedPort, C.NewSessionList())
 
 		// Create and start UDP listener
 		udpListener := &UDPPortListener{
@@ -249,12 +248,13 @@ func SetupPorts(ctx context.Context, config *config.ServerConfig) error {
 			PortMap:    portMap,
 			SourceMap:  safemap.NewSafeMap[string, *multidialer.Stream](),
 		}
-		err := udpListener.Start()
-		if err != nil {
-			return fmt.Errorf("failed to start UDP listener for port %d: %v", port, err)
+		closer, startErr := udpListener.Start(ctx)
+		if startErr != nil {
+			return nil, fmt.Errorf("failed to start UDP listener for port %d: %v", port, startErr)
 		}
+		closers = append(closers, closer)
 		log.Infof("Started UDP listener for port %d", port)
 	}
 
-	return nil
+	return closers, nil
 }

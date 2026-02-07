@@ -1,7 +1,6 @@
 package server
 
 import (
-	"container/list"
 	"context"
 	"fmt"
 	"io"
@@ -18,58 +17,45 @@ import (
 
 type TCPPortListener struct {
 	TaggedPort  C.TaggedPort
-	PortMap     *safemap.SafeMap[C.TaggedPort, *list.List]
+	PortMap     *safemap.SafeMap[C.TaggedPort, *C.SessionList]
 	nextSession int
 	mutex       sync.Mutex
 }
 
-func (l *TCPPortListener) Start() error {
+// Start begins accepting TCP connections. Returns a closer function to stop the listener.
+func (l *TCPPortListener) Start(ctx context.Context) (closer func(), err error) {
 	listener, err := net.Listen("tcp", net.JoinHostPort("0.0.0.0", fmt.Sprint(l.TaggedPort.Port)))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
+				// Check if context was cancelled (shutdown)
+				if ctx.Err() != nil {
+					return
+				}
 				log.Warnf("Failed to accept connection for port %s: %v", l.TaggedPort.String(), err)
 				continue
 			}
+
 			sessionList, ac := l.PortMap.Get(l.TaggedPort)
+			if !ac || sessionList == nil {
+				log.Warnf("No session list for port %s, closing connection", l.TaggedPort.String())
+				conn.Close()
+				continue
+			}
+
 			l.mutex.Lock()
-			if !ac || sessionList.Len() == 0 {
-				l.mutex.Unlock()
+			comp := sessionList.RoundRobin(&l.nextSession)
+			l.mutex.Unlock()
+
+			if comp == nil {
 				log.Warnf("No available session for port %s, closing connection", l.TaggedPort.String())
 				conn.Close()
 				continue
 			}
-			if l.nextSession >= sessionList.Len() {
-				l.nextSession = 0
-			}
-			element := sessionList.Front()
-			if element == nil {
-				l.mutex.Unlock()
-				log.Warnf("Session list is empty for port %s, closing connection", l.TaggedPort.String())
-				conn.Close()
-				continue
-			}
-			for i := 0; i < l.nextSession; i++ {
-				if element == nil {
-					log.Warnf("Session list modified during iteration for port %s, resetting nextSession", l.TaggedPort.String())
-					l.nextSession = 0
-					break
-				}
-				element = element.Next()
-			}
-			if element == nil {
-				log.Warnf("No valid session found for port %s, closing connection", l.TaggedPort.String())
-				l.mutex.Unlock()
-				conn.Close()
-				continue
-			}
-			comp := element.Value.(*C.SessionIndexCompound)
-			l.nextSession++
-			l.mutex.Unlock()
 
 			log.Infof("Accepted connection for port %s from %s", l.TaggedPort.String(), conn.RemoteAddr())
 			if comp.Session == nil {
@@ -92,20 +78,15 @@ func (l *TCPPortListener) Start() error {
 				conn.Close()
 				continue
 			}
-			written := 0
 			// Instrumentation
 			if ts, ok := newConn.(interface{ ID() uint16 }); ok {
 				log.Debugf("server: wrote header for tcp stream id=%d port=%s", ts.ID(), l.TaggedPort.String())
 			}
-			for written < len(hdr) {
-				n, werr := newConn.Write(hdr[written:])
-				if werr != nil {
-					log.Errorf("Failed to write tagged port to new connection: %v", werr)
-					newConn.Close()
-					conn.Close()
-					continue
-				}
-				written += n
+			if writeErr := writeAll(newConn, hdr); writeErr != nil {
+				log.Errorf("Failed to write tagged port to new connection: %v", writeErr)
+				newConn.Close()
+				conn.Close()
+				continue
 			}
 			// Now use connection copy to relay data
 			go func(localConn net.Conn, remoteConn multidialer.Stream) {
@@ -132,35 +113,39 @@ func (l *TCPPortListener) Start() error {
 			}(conn, newConn)
 		}
 	}()
-	return nil
+	return func() { listener.Close() }, nil
 }
 
 type UDPPortListener struct {
 	TaggedPort C.TaggedPort
-	PortMap    *safemap.SafeMap[C.TaggedPort, *list.List]
+	PortMap    *safemap.SafeMap[C.TaggedPort, *C.SessionList]
 	// SourceMap maps remote UDP addr string (IP:port) -> multiplexed stream
 	SourceMap   *safemap.SafeMap[string, *multidialer.Stream]
 	nextSession int
 	mutex       sync.Mutex
 }
 
-func (l *UDPPortListener) Start() error {
+// Start begins accepting UDP datagrams. Returns a closer function to stop the listener.
+func (l *UDPPortListener) Start(ctx context.Context) (closer func(), err error) {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{
 		IP:   net.ParseIP("0.0.0.0"),
 		Port: int(l.TaggedPort.Port),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to listen on UDP port %s: %w", l.TaggedPort.String(), err)
+		return nil, fmt.Errorf("failed to listen on UDP port %s: %w", l.TaggedPort.String(), err)
 	}
 	go func() {
-		buf := make([]byte, 4096)
+		buf := make([]byte, 65535) // Full UDP datagram size
 		for {
 			n, addr, err := conn.ReadFromUDP(buf)
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				log.Warnf("Failed to read from UDP port %s: %v", l.TaggedPort.String(), err)
 				continue
 			}
-			log.Infof("Received %d bytes from %s on UDP port %s", n, addr.String(), l.TaggedPort.String())
+			log.Debugf("Received %d bytes from %s on UDP port %s", n, addr.String(), l.TaggedPort.String())
 			// Handle the received data
 			// First, check whether an existing stream exists for this address
 			key := addr.String()
@@ -176,31 +161,19 @@ func (l *UDPPortListener) Start() error {
 				}
 			} else {
 				sessionList, ac := l.PortMap.Get(l.TaggedPort)
-				if !ac || sessionList.Len() == 0 {
+				if !ac || sessionList == nil {
 					log.Warnf("No available session for port %s, ignoring data from %s", l.TaggedPort.String(), addr.String())
 					continue
 				}
 
 				l.mutex.Lock()
-				if l.nextSession >= sessionList.Len() {
-					l.nextSession = 0
-				}
-				element := sessionList.Front()
-				for i := 0; i < l.nextSession; i++ {
-					if element == nil {
-						log.Warnf("Reached nil element before target index %d for port %s", l.nextSession, l.TaggedPort.String())
-						break
-					}
-					element = element.Next()
-				}
-				if element == nil {
-					log.Warnf("No valid session element found for port %s, ignoring data from %s", l.TaggedPort.String(), addr.String())
-					l.mutex.Unlock()
+				comp := sessionList.RoundRobin(&l.nextSession)
+				l.mutex.Unlock()
+
+				if comp == nil {
+					log.Warnf("No available session for port %s, ignoring data from %s", l.TaggedPort.String(), addr.String())
 					continue
 				}
-				comp := element.Value.(*C.SessionIndexCompound)
-				l.nextSession++
-				l.mutex.Unlock()
 
 				if comp.Session == nil {
 					log.Warnf("Session is nil for port %s, ignoring data from %s", l.TaggedPort.String(), addr.String())
@@ -212,26 +185,20 @@ func (l *UDPPortListener) Start() error {
 					log.Errorf("Failed to open stream for session %v: %v", comp.Session, err)
 					continue
 				}
-				// Write the tagged port to the new stream
-				// Write the 3-byte header fully
+				// Write the tagged port to the new stream (3-byte header)
 				hdr := l.TaggedPort.Bytes()
 				if len(hdr) != 3 {
 					log.Errorf("Invalid tagged port bytes length: %d for %s", len(hdr), l.TaggedPort.String())
 					newStream.Close()
 					continue
 				}
-				written := 0
 				if ts, ok := newStream.(interface{ ID() uint16 }); ok {
 					log.Debugf("server: wrote header for udp stream id=%d port=%s", ts.ID(), l.TaggedPort.String())
 				}
-				for written < len(hdr) {
-					n, werr := newStream.Write(hdr[written:])
-					if werr != nil {
-						log.Errorf("Failed to write tagged port to new stream: %v", werr)
-						newStream.Close()
-						continue
-					}
-					written += n
+				if writeErr := writeAll(newStream, hdr); writeErr != nil {
+					log.Errorf("Failed to write tagged port to new stream: %v", writeErr)
+					newStream.Close()
+					continue
 				}
 				// Store the new stream in the source map
 				l.SourceMap.Set(key, &newStream)
@@ -251,7 +218,7 @@ func (l *UDPPortListener) Start() error {
 			}
 		}
 	}()
-	return nil
+	return func() { conn.Close() }, nil
 }
 
 // handleUDPStreamResponse handles responses from the stream back to the UDP client
@@ -262,7 +229,7 @@ func (l *UDPPortListener) handleUDPStreamResponse(conn *net.UDPConn, clientAddr 
 		log.Infof("Closed stream for %s on UDP port %s", clientAddr.String(), l.TaggedPort.String())
 	}()
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, 65535) // Full UDP datagram size
 	lastActivity := time.Now()
 	timeout := 60 * time.Second // 60 second timeout for idle streams
 
@@ -298,7 +265,19 @@ func (l *UDPPortListener) handleUDPStreamResponse(conn *net.UDPConn, clientAddr 
 				log.Errorf("Failed to send response to UDP client %s: %v", clientAddr.String(), err)
 				return
 			}
-			log.Infof("Sent %d bytes response to %s on UDP port %s", n, clientAddr.String(), l.TaggedPort.String())
+			log.Debugf("Sent %d bytes response to %s on UDP port %s", n, clientAddr.String(), l.TaggedPort.String())
 		}
 	}
+}
+
+// writeAll writes all of p to w, retrying on short writes.
+func writeAll(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if err != nil {
+			return err
+		}
+		p = p[n:]
+	}
+	return nil
 }

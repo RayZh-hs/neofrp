@@ -95,8 +95,11 @@ func ValidateClientConfig(config *config.ClientConfig) error {
 		if conn.Type != "tcp" && conn.Type != "udp" {
 			return fmt.Errorf("connection %d: invalid connection type: %s", i, conn.Type)
 		}
-		if conn.ServerPort == 0 {
-			return fmt.Errorf("connection %d: server_port is required", i)
+		if conn.ServerPort == 0 || conn.ServerPort > 65535 {
+			return fmt.Errorf("connection %d: server_port must be between 1 and 65535", i)
+		}
+		if conn.LocalPort == 0 || conn.LocalPort > 65535 {
+			return fmt.Errorf("connection %d: local_port must be between 1 and 65535", i)
 		}
 	}
 	return nil
@@ -106,8 +109,8 @@ func ValidateServerConfig(config *config.ServerConfig) error {
 	if config.TransportConfig.Protocol != "quic" && config.TransportConfig.Protocol != "tcp" {
 		return fmt.Errorf("invalid transport protocol: %s. Options are: quic, tcp", config.TransportConfig.Protocol)
 	}
-	if config.TransportConfig.Port == 0 {
-		return fmt.Errorf("server port is required in field 'transport'")
+	if config.TransportConfig.Port == 0 || config.TransportConfig.Port > 65535 {
+		return fmt.Errorf("server port must be between 1 and 65535")
 	}
 	if len(config.RecognizedTokens) == 0 {
 		return fmt.Errorf("at least one recognized token is required for the server to start")
@@ -123,6 +126,16 @@ func ValidateServerConfig(config *config.ServerConfig) error {
 	if config.TransportConfig.KeyFile != "" {
 		if _, err := os.Stat(config.TransportConfig.KeyFile); os.IsNotExist(err) {
 			return fmt.Errorf("key_file not found: %s", config.TransportConfig.KeyFile)
+		}
+	}
+	for i, port := range config.ConnectionConfig.TCPPorts {
+		if port == 0 || port > 65535 {
+			return fmt.Errorf("tcp_ports[%d]: port must be between 1 and 65535", i)
+		}
+	}
+	for i, port := range config.ConnectionConfig.UDPPorts {
+		if port == 0 || port > 65535 {
+			return fmt.Errorf("udp_ports[%d]: port must be between 1 and 65535", i)
 		}
 	}
 	return nil
