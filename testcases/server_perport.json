@@ -1,0 +1,19 @@
+{
+    "log": {
+        "log_level": "debug"
+    },
+    "recognized_tokens": [],
+    "transport": {
+        "protocol": "quic",
+        "port": 3400
+    },
+    "connections": {
+        "tcp_ports": [
+            { "port": 35560, "tokens": ["token_a"] },
+            { "port": 35561, "tokens": ["token_b"] }
+        ],
+        "udp_ports": [
+            35562
+        ]
+    }
+}

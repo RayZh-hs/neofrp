@@ -18,8 +18,10 @@ import (
 )
 
 type ControlHandler struct {
-	config *config.ServerConfig
-	conn   multidialer.Stream
+	config             *config.ServerConfig
+	conn               multidialer.Stream
+	authenticatedToken string         // Token used during handshake
+	NegotiatedPorts    []C.TaggedPort // Ports successfully negotiated
 }
 
 func NewControlHandler(config *config.ServerConfig, conn multidialer.Stream) *ControlHandler {
@@ -64,22 +66,83 @@ func (h *ControlHandler) Handshake() error {
 	}
 
 	// Constant-time comparison against recognized tokens to reduce timing side-channel
+	// Check both global tokens and per-port tokens
 	authorized := false
+	tokenStr := string(tokenBytes)
+
+	// First check global recognized tokens
 	for _, t := range h.config.RecognizedTokens {
 		if len(t) != len(tokenBytes) {
 			continue
 		}
 		if subtle.ConstantTimeCompare([]byte(t), tokenBytes) == 1 {
 			authorized = true
+			h.authenticatedToken = t
 			break
 		}
 	}
+
+	// If not found in global tokens, check per-port tokens
+	if !authorized {
+		// Collect all unique tokens from port configs
+		tokenSet := make(map[string]bool)
+		for _, pc := range h.config.ConnectionConfig.TCPPorts {
+			for _, t := range pc.Tokens {
+				tokenSet[t] = true
+			}
+		}
+		for _, pc := range h.config.ConnectionConfig.UDPPorts {
+			for _, t := range pc.Tokens {
+				tokenSet[t] = true
+			}
+		}
+		for t := range tokenSet {
+			if len(t) != len(tokenBytes) {
+				continue
+			}
+			if subtle.ConstantTimeCompare([]byte(t), tokenBytes) == 1 {
+				authorized = true
+				h.authenticatedToken = tokenStr
+				break
+			}
+		}
+	}
+
 	if !authorized {
 		h.conn.Write([]byte{P.ReturnCodeUnrecognizedToken})
 		// Do not echo token value in log to avoid secret leakage
 		return fmt.Errorf("handshake: unrecognized token (len=%d)", len(tokenBytes))
 	}
 	return nil
+}
+
+// tokenHasPortAccess checks if the authenticated token has access to the specified port
+func (h *ControlHandler) tokenHasPortAccess(portType string, port C.PortType) bool {
+	// Global tokens have access to all ports
+	for _, t := range h.config.RecognizedTokens {
+		if t == h.authenticatedToken {
+			return true
+		}
+	}
+
+	// Check per-port tokens
+	pc := h.config.ConnectionConfig.GetPortConfig(portType, port)
+	if pc == nil {
+		return false // Port not configured
+	}
+
+	// If no per-port tokens defined, port is accessible by any authenticated user
+	if len(pc.Tokens) == 0 {
+		return true
+	}
+
+	// Check if token is in port's token list
+	for _, t := range pc.Tokens {
+		if t == h.authenticatedToken {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *ControlHandler) Negotiate() error {
@@ -120,26 +183,47 @@ func (h *ControlHandler) Negotiate() error {
 		return false
 	}
 
-	// Parse the port requests and check availability
+	// Parse the port requests and check availability and authorization
 	responses := make([]byte, length)
+	h.NegotiatedPorts = make([]C.TaggedPort, 0, length)
+
 	for i := 0; i < length; i++ {
-		portType := portData[i*3]
+		portTypeByte := portData[i*3]
 		port := uint16(portData[i*3+1])<<8 | uint16(portData[i*3+2])
 
-		// Check if port is available
-		isAvailable := false
-		switch portType {
+		var portType string
+		var availablePorts []C.PortType
+
+		switch portTypeByte {
 		case C.PortTypeTCP:
-			isAvailable = containsPort(h.config.ConnectionConfig.TCPPorts, C.PortType(port))
+			portType = "tcp"
+			availablePorts = h.config.ConnectionConfig.GetAllTCPPorts()
 		case C.PortTypeUDP:
-			isAvailable = containsPort(h.config.ConnectionConfig.UDPPorts, C.PortType(port))
+			portType = "udp"
+			availablePorts = h.config.ConnectionConfig.GetAllUDPPorts()
+		default:
+			responses[i] = P.ReturnCodeOtherError
+			continue
 		}
 
-		if isAvailable {
-			responses[i] = P.ReturnCodeAccepted
-		} else {
+		// Check if port is available in config
+		if !containsPort(availablePorts, C.PortType(port)) {
 			responses[i] = P.ReturnCodePortInUse
+			continue
 		}
+
+		// Check if token has access to this port
+		if !h.tokenHasPortAccess(portType, C.PortType(port)) {
+			log.Warnf("Token denied access to %s port %d", portType, port)
+			responses[i] = P.ReturnCodePortInUse // Reuse error code to not leak auth info
+			continue
+		}
+
+		responses[i] = P.ReturnCodeAccepted
+		h.NegotiatedPorts = append(h.NegotiatedPorts, C.TaggedPort{
+			PortType: portType,
+			Port:     C.PortType(port),
+		})
 	}
 
 	// Send response: [LENGTH] [RESPONSE]

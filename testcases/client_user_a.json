@@ -1,0 +1,18 @@
+{
+    "log": {
+        "log_level": "debug"
+    },
+    "token": "token_a",
+    "transport": {
+        "protocol": "quic",
+        "server_ip": "127.0.0.1",
+        "server_port": 3400
+    },
+    "connections": [
+        {
+            "type": "tcp",
+            "local_port": 25560,
+            "server_port": 35560
+        }
+    ]
+}

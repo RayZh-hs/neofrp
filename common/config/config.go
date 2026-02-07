@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"neofrp/common/constant"
 )
 
@@ -38,9 +39,43 @@ type ServerTransportConfig struct {
 	KeyFile  string `json:"key_file,omitempty"`  // Path to key file
 }
 
+// PortConfig represents a port with optional per-port tokens
+type PortConfig struct {
+	Port   constant.PortType              `json:"port"`
+	Tokens []constant.ClientAuthTokenType `json:"tokens,omitempty"`
+}
+
+// PortConfigList supports both legacy (plain numbers) and new (object) formats
+type PortConfigList []PortConfig
+
+func (p *PortConfigList) UnmarshalJSON(data []byte) error {
+	// Try to parse as array of mixed types
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*p = make([]PortConfig, 0, len(raw))
+	for _, item := range raw {
+		// Try parsing as number first (legacy format)
+		var port constant.PortType
+		if err := json.Unmarshal(item, &port); err == nil {
+			*p = append(*p, PortConfig{Port: port})
+			continue
+		}
+		// Try parsing as PortConfig object (new format)
+		var pc PortConfig
+		if err := json.Unmarshal(item, &pc); err == nil {
+			*p = append(*p, pc)
+			continue
+		}
+	}
+	return nil
+}
+
 type ServerConnectionConfig struct {
-	TCPPorts []constant.PortType `json:"tcp_ports,omitempty"`
-	UDPPorts []constant.PortType `json:"udp_ports,omitempty"`
+	TCPPorts PortConfigList `json:"tcp_ports,omitempty"`
+	UDPPorts PortConfigList `json:"udp_ports,omitempty"`
 }
 
 type ConnectionConfig struct {
@@ -49,3 +84,41 @@ type ConnectionConfig struct {
 	ServerIP   string `json:"server_ip"`
 	ServerPort int    `json:"server_port"`
 }
+
+// GetAllTCPPorts returns all TCP port numbers for backward compatibility
+func (c *ServerConnectionConfig) GetAllTCPPorts() []constant.PortType {
+	ports := make([]constant.PortType, len(c.TCPPorts))
+	for i, pc := range c.TCPPorts {
+		ports[i] = pc.Port
+	}
+	return ports
+}
+
+// GetAllUDPPorts returns all UDP port numbers for backward compatibility
+func (c *ServerConnectionConfig) GetAllUDPPorts() []constant.PortType {
+	ports := make([]constant.PortType, len(c.UDPPorts))
+	for i, pc := range c.UDPPorts {
+		ports[i] = pc.Port
+	}
+	return ports
+}
+
+// GetPortConfig returns the PortConfig for a given port and type, or nil if not found
+func (c *ServerConnectionConfig) GetPortConfig(portType string, port constant.PortType) *PortConfig {
+	var list PortConfigList
+	switch portType {
+	case "tcp":
+		list = c.TCPPorts
+	case "udp":
+		list = c.UDPPorts
+	default:
+		return nil
+	}
+	for i := range list {
+		if list[i].Port == port {
+			return &list[i]
+		}
+	}
+	return nil
+}
+
