@@ -1,0 +1,64 @@
+name: Build
+
+on:
+  push: {}
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target_name }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_name: linux_x64
+            runs_on: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            exe_ext: ""
+          - target_name: macOS_aarch64
+            runs_on: macos-14
+            goos: darwin
+            goarch: arm64
+            exe_ext: ""
+          - target_name: windows_x64
+            runs_on: windows-latest
+            goos: windows
+            goarch: amd64
+            exe_ext: ".exe"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build frpc + frps
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          out_dir="dist/${{ matrix.target_name }}"
+          mkdir -p "$out_dir"
+
+          go build -trimpath -ldflags "-s -w" -buildvcs=false -o "$out_dir/frpc${{ matrix.exe_ext }}" ./cmd/client
+          go build -trimpath -ldflags "-s -w" -buildvcs=false -o "$out_dir/frps${{ matrix.exe_ext }}" ./cmd/server
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: neofrp-${{ matrix.target_name }}
+          path: dist/${{ matrix.target_name }}/
+          if-no-files-found: error
